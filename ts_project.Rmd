@@ -1,0 +1,298 @@
+---
+title: "Time Series Forecasting Project"
+author: "Sia Phulambrikar"
+date: "2023-12-25"
+output: rmdformats::readthedown
+---
+
+```{r setup, include=FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(fpp3)
+library(fpp2)
+library(tidyverse)
+library(strucchange)
+library(vars)
+library(fable.prophet)
+library(fabletools)
+library(feasts)
+```
+
+## Introduction      
+
+In this project, I conduct time series analysis of Australian Monthly Drug Sales. Following some initial exploratory analysis, I experimented with multiple predictive models, and used residual diagnostics and other evaluation metrics to select the best forecast for the data.    
+
+The data has been sourced from the `tsibbledata` package, sourced from Medicare Australia. I fit the following models to the data: 
+
+- ARIMA/S-ARIMA.  
+- ETS with Multiplicative Seasonality  
+- Prophet.  
+- Neural Network Autoregression
+
+Finally, I used residual diagnostics, AIC and BIC, Mean Absolute Percantage Error (MAPE) and the CUSUM Test to evaluate model accuracy and fit.
+
+
+```{r}
+#preparing the dataset
+PBS <- tsibbledata::PBS 
+
+data <- PBS |>
+  filter(ATC2 == "A10") |>
+  dplyr::select(Month, Concession, Type, Cost) |>
+  summarise(TotalC = sum(Cost)) |>
+  mutate(Cost = TotalC / 1e6) |>
+  dplyr::select(Month, Cost)
+```
+
+
+## Exploratory Analysis 
+
+For our initial exploration of the data, we can inspect the following:     
+
+- Summary Statistics   
+- Histogram   
+- Time Series plot, to find Trend, Seasonality and Cyclical Patterns       
+- Stationarity of the time series          
+- ACF and PACF plots      
+
+```{r}
+#summary statistics
+summary(data$Cost)
+
+#histogram
+ggplot(data, aes(x=Cost)) + 
+  geom_histogram(color="blue", fill="lightblue") +
+  geom_vline(aes(xintercept=mean(Cost)),
+            color="black", linetype="dashed", linewidth=1) +
+  ggtitle('Histogram of Antidiabetic Drug Sales Data') +
+  xlab('Sales') + ylab('Count')
+```
+
+
+```{r}
+#time series plot
+autoplot(data, Cost) +
+  labs(y = "$ (millions)", x = "Time (Months)",
+       title = "Australian Antidiabetic Drug Sales")
+```
+
+- From the Sales time series plot, we see that there is evidence of a strong upward trend. There is a low degree of mean reversion.    
+- We see strong seasonality in the data, thus we would need to use seasonal models. Since the seasonality seems to change with time, it could be multiplicative seasonality. We can further explore this by doing a seasonal decomposition. 
+
+```{r}
+#seasonal decomposition
+stl(data, s.window = 13) %>% autoplot() + labs(title = "Seasonal Decomposition Plot")
+```
+
+- The seasonal decomposition confirms that there is a clear upward trend.    
+- The seasonal component varies with time, thus we should use multiplicative seasonality while modelling.   
+- There is a lot of variation left in the remainder besides trend and season - this could be the evidence for a cyclical component.   
+
+From observing the time series and seasonal decompositions, we understand that the data does not seem stationary. Since there is trend, we can easily rule out stationarity. We would need to make the data more stationary to model it effectively. We can do this by applying a transformation to the data, such as taking its first or second difference. A simple use of the `ndiffs()` function can tell us the degree of differencing required. Similarly, we can use the `unitroot_nsdiffs()` function to find the degree of seasonal differencing required. The functions, as used below, suggest that there is 1 degree of non-seasonal difference needed, but no seasonal differencing is required. 
+
+
+```{r}
+#degree of differencing
+ndiffs(data$Cost)
+unitroot_nsdiffs(aus_holidays)
+ACF(data, Cost) %>% autoplot() + labs(title = 'Autocorrelation Function (ACF) Plot')
+```
+
+- Interpreting the ACF Plot: When data have a trend, ACF values are high and positive for smaller lags, and then decrease over time. This is because values that are closer in time are also closer in value. Here, all spikes on the ACF plot are high and positive - clearly pointing towards a strong trend. There is also a scalloping pattern in the spikes - this is due to the presence of seasonality.
+
+Before we begin the modelling process, we should difference the data.
+
+```{r}
+#differencing
+cost <- ts(data$Cost, start = c(1991, 7), end = c(2008, 6), frequency = 12)
+cost_diff <- ts(diff(data$Cost), start = c(1991, 7), end = c(2008, 6), frequency = 12)
+tsdisplay(cost_diff, main = "ACF and PACF of the Differenced Series")
+```
+
+Now, analyzing the ACF and PACF will give us more information about which models we can try.
+
+- ACF: The ACF Plot has one significant spike at lag k = 1, a large spike at lag k = 11, 12 and 13. There is also another significant spike at lag k = 24. Since we see significant spikes at multiples of k = 12, this suggests monthly seasonality patterns. Since there are two such spikes, we could try using an S-MA(2) model, with seasonality frequency of 12.
+
+- PACF: The PACF Plot shows significant spikes at lag k = 1, k = 9, 10, 11, 12 and 13. The PACF decreases otherwise, and spikes after this are not statistically different from 0. This also supports the use of a seasonal model with monthly frequency. We could experiment with an S-AR(1) model alongside S-MA(2).   
+
+## Modelling
+
+List of models we will try:     
+
+- ARIMA/S-ARIMA    
+- ETS with Multiplicative Seasonality    
+- Prophet     
+- Neural Network Autoregression     
+
+At this stage, we should create train and test sets to fit to and evaluate our models. We can use around 10% of the data, so the time series after 2006, for testing.
+
+```{r}
+train <- window(cost, end = c(2005, 12))
+test <- window(cost, start = c(2006,1))
+```
+
+
+## Model 1: ARIMA 
+
+First, we can try to fit an S-MA(2), or ARIMA(0,1,2)(0,0,2) model to the differenced data. Note that the '1' in the order adds a degree of differencing to the data. We can explore the residuals of the model to determine whether it is a good fit.
+
+```{r}
+arima.mod <- arima(train, order = c(0,1,2), seasonal = c(0,0,2))
+resid.arima <- resid(arima.mod)
+ggtsdisplay(resid.arima, main = "ARIMA(0,0,2)(0,0,2) Residual Diagnostics")
+```
+
+The residuals' time series plot does not seem stationary. The ACF and PACF both have lags at k = 12, 24, 36. There is still some leftover seasonality present in the residuals that we have not accounted for. We can use a different ARIMA model, the order for which is generated by the auto.arima function. The function compares AIC values over multiple ARIMA orders, and selects the best fit.
+
+```{r}
+autoarima.mod <- auto.arima(train)
+autoarima.mod
+resid.autoarima <- resid(autoarima.mod)
+ggtsdisplay(resid.autoarima, main = "auto.arima Model ARIMA(0,1,1)(0,1,2) Residual Diagnostics")
+Box.test(resid.autoarima)
+```
+The auto.arima model selected is ARIMA(0,1,1)(0,1,2). Noting how this optimal selected model is different from the one we picked before - this model uses MA(1) and S-MA(2), with one degree of seasonal differencing alongwith regular differencing.
+
+The residual diagnostic plot shows that most of the spikes are now statistically insignificant. We still see significant spikes in the ACF at k = 24, and PACF at k = 11, 24. This might indicate the presence of leftover yearly seasonality in the residuals. However, this is the ARIMA model with the best AIC fit. Also, a Box-Pierce test on the residuals gives a p-value of 0.4277, which means residuals are not serially correlated at the 10% level.
+We should try other types of models to see if they fit the data better.
+
+```{r}
+autoplot(train) +
+  autolayer(autoarima.mod$fitted, series = "ARIMA(0,1,1)(0,1,2) Fit") +
+  labs(title = "ARIMA Model Fit on Differenced Data", y = "Sales ($ millions)")
+```
+
+## Model 2: ETS (Holt-Winters') Model
+
+From looking at the STL Decomposition plot in the Exploratory Analysis, the remainder seems to be multiplicative, with changing variation over time. Thus, we can use an ETS model with Multiplicative Errors. The seasonal component also seems to have varying seasonality over time, so we use multiplicative seasonality. ETS(M, A, M) is the model known as Multiplicative Holt-Winters' Method with multiplicative errors.
+
+```{r, include=FALSE}
+train <- data[1:174,]
+test <- data[175:204,]
+```
+
+
+```{r}
+ets.mod <- train |>
+  model(ETS(Cost ~ error("M") + trend("A") + season("M")))
+ets.resid <- residuals(ets.mod)
+ggtsdisplay(ets.resid$.resid, main = "Residual Diagnostics for ETS(M,A,M) model")
+```
+
+We can evaluate the model fit by examining residuals left from the model.   
+The time series shows a fairly stationary process, similar to a white noise series. The ACF and PACF plots both show one sharp spike at lag k = 12, representing some yearly seasonal trend we have failed to capture in the model.
+
+```{r}
+autoplot(train, .vars = Cost) +
+  autolayer(fitted(ets.mod), .vars = .fitted, series = "ETS(M,A,M)", color = "maroon") + 
+  guides(colour = guide_legend(title = "Forecast"))  +
+  labs(x = 'Time', title = "Multiplicative Holt-Winters' Model Fit")
+```
+
+Overall, from residual diagnostics and the fitted values graph, the ETS(M,A,M) model seems to provide a decent fit to the data.
+
+## Model 3: Prophet Model 
+
+We can also try forecasting with the Prophet model. This model was originally built by Facebook for forecasting daily data with weekly and yearly seasonal components. It can be found in the `fable::prophet` package. Prophet is a nonlinear regression model, that computes a growth term (piece-wise trend component), a seasonal term, and also a holiday variation term.
+
+Since our sales data has strong seasonality and several seasons of historical data, we can try using the Prophet model for forecasting.
+
+```{r}
+prophet.mod <- train |>
+  model(prophet = prophet(Cost~season(period = 12, order = 10) + 
+                           season(period = 4, order = 3)))
+
+autoplot(train, .vars = Cost) + 
+  autolayer(fitted(prophet.mod), .vars = .fitted, color = "maroon") + 
+  guides(colour = guide_legend(title = "Forecast"))  +
+  labs(x = 'Time', title = "Prophet Model Fit")
+
+prophet.resid <- residuals(prophet.mod)
+ggtsdisplay(prophet.resid$.resid, main = "Residual Diagnostics for Prophet model")
+```
+
+The residual plot above indicates the presence of some leftover yearly seasonality, as there is a sharp spike in the ACF and PACF at lag k = 12. The time series does not look fully stationary, and does show some leftover seasonal trend.
+
+
+## Model 4: Neural Network Model 
+
+Neural Networks are models based on mathematical models of the brain. We can apply the concepts of Neural Networks to a Neural Network Autoregression Model, or NNAR model.
+
+```{r}
+nn.mod <- as_tsibble(train) |>
+  model(NNETAR(Cost))
+
+resid.nn <- residuals(nn.mod)
+ggtsdisplay(resid.nn$.resid, main = "Residual Diagnostics for Neural Network Autoregression")
+```
+
+From fitting the NNAR model to the data, we can see that the residuals seem like a white noise series. The ACF and PACF plots show a statistically significant spike at lag k = 3, while the others autocorrelations not statistically significant. 
+
+```{r}
+autoplot(train, .vars = Cost) + 
+  autolayer(fitted(nn.mod), .vars = .fitted, color = "maroon") + 
+  guides(colour = guide_legend(title = "Forecast"))  +
+  labs(x = 'Time', title = "Neural Network Autoregression Fit")
+```
+
+## Model Selection
+
+We use the AIC of the models used to find which the optimal model. This should be the model with the minimum AIC value.
+
+```{r, echo=FALSE}
+aic_df <- data.frame(model = c("ARIMA(0,1,1)(0,1,2)", "ETS", "Prophet", "NNAR"), AIC = c(autoarima.mod$aic, glance(ets.mod)$AIC, glance(prophet.mod)$AIC, glance(nn.mod)$AIC))
+
+aic_df[order(aic_df$AIC),]
+```
+
+The model with the lowest AIC is the ARIMA(0,1,1)(0,1,2) model. Some features of the model are:       
+
+- This model includes one degree of non-seasonal differencing, and one degree of seasonal differencing, indicating that our data is clearly nonstationary.    
+- The model includes a non-seasonal MA(1) component, along with a seasonal MA(2) component.    
+- The ACF plot of model residuals shows that most of the spikes are now statistically insignificant. This means residuals are close to a white noise series, and any time-variant aspects on the data have been captured well by our model. Also, a Box-Pierce test on the residuals gives a p-value of 0.4277, which means residuals are not serially correlated at the 10% level. Therefore at the 10% level, we can conclude that the residuals are just white noise.     
+
+
+A final test we can use for evaluating our chosen model is the Recursive CUSUM Test. Cusum tests assess the stability of parameters in the chosen model, based on rescursive residuals computed iteratively from the data. We can identify structural breaks in the model over time using the test. 
+
+```{r}
+y = recresid(autoarima.mod$residuals~1)
+plot(efp(autoarima.mod$res~1, type = "Rec-CUSUM"))
+```
+
+From the Recursive CUSUM Test plot seen above, we can see that the recursive CUSUM path remains within the boundaries and does not depart from the mean 0 value. This means there are no expected structural breaks in the model.  
+
+## Forecasts and Conclusion
+
+Finally, we can forecast over testing data with our selected ARIMA model.
+
+```{r, include=FALSE}
+train <- window(cost, end = c(2005, 12))
+test <- window(cost, start = c(2006,1))
+```
+
+
+```{r}
+autoplot(train)+
+  autolayer(forecast(autoarima.mod, h = 30), series = "Forecasted Sales", PI = FALSE)+
+  autolayer(test, series = "Test data") +
+  guides(colour = guide_legend(title = "Forecast"))  +
+  labs(x = 'Time', title = "ARIMA(0,1,1)(0,1,2) Forecasts")
+```
+
+We can further evaluate our forecast performance by calculating out-of-sample forecast accuracy, using metrics like RMSE (Root Mean Squared Error) and MAPE (Mean Absolute Percentage Error). These are useful metrics to compare current forecast performance with any models created in future, and can highlight scope for improvement.
+
+```{r}
+accuracy(forecast(autoarima.mod, h = 30), cost)
+```
+
+The RMSE on the training set is 0.558, while that on the test set is 2.635. The MAPE is  4.191 for the training set, while it is 10.398 for the test set.  The forecast is quite accurate on the training set with an MAPE of under 5%, but delivers an acceptable accuracy on the test set. A lower MAPE value indicates a more accurate prediction – an MAPE of 0% means the prediction is the same as the actual, while a higher MAPE value indicates a less accurate prediction. Therefore this does offer some scope for improvement in the model.  
+
+ 
+### References
+ 
+- Hyndman, R.J., & Athanasopoulos, G. (2021) Forecasting: principles and practice, 3rd edition, OTexts: Melbourne, Australia. https://otexts.com/fpp3/. Accessed Dec 1, 2023.    
+
+- “2.1 Moving Average Models (MA Models): Stat 510.” PennState: Statistics Online Courses. Accessed Dec 1, 2023. https://online.stat.psu.edu/stat510/lesson/2/2.1.   
+
+
+
+
